@@ -1,11 +1,17 @@
 # sequence_dataset_gru.py
 # Build patient-level sequences from rolling-window features.parquet + samples.csv
 # Outputs (X, y, length) per patient for GRU/LSTM models.
+#
+# Uses the 'split' column in samples.csv (train/val/test) to match your ML pipeline.
+# Enforces patient-level splitting: a patient must not appear in multiple splits.
+#
+# IMPORTANT:
+# - If samples.csv includes 't_event' and 'lead_time_mins', we keep them in df for evaluation,
+#   but we EXCLUDE them from model features so they are not normalized or used as inputs.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,39 +21,53 @@ from torch.utils.data import Dataset
 import config
 
 
-@dataclass
-class SplitIndices:
-    train_pids: np.ndarray
-    val_pids: np.ndarray
-    test_pids: np.ndarray
-
-
 def _read_samples(samples_path: str) -> pd.DataFrame:
     df = pd.read_csv(samples_path)
-    need = {"patientunitstayid", "t_end", "label"}
+
+    need = {"patientunitstayid", "t_end", "label", "split"}
     missing = need - set(df.columns)
     if missing:
         raise ValueError(f"samples.csv missing columns: {sorted(missing)}")
 
-    df = df[["patientunitstayid", "t_end", "label"]].copy()
+    # Optional columns for true lead-time evaluation
+    optional_cols = []
+    for c in ["t_event", "lead_time_mins"]:
+        if c in df.columns:
+            optional_cols.append(c)
+
+    keep_cols = ["patientunitstayid", "t_end", "label", "split"] + optional_cols
+    df = df[keep_cols].copy()
 
     df = df.replace([np.inf, -np.inf], np.nan)
+
     df["patientunitstayid"] = pd.to_numeric(df["patientunitstayid"], errors="coerce")
     df["t_end"] = pd.to_numeric(df["t_end"], errors="coerce")
     df["label"] = pd.to_numeric(df["label"], errors="coerce")
 
-    df = df.dropna(subset=["patientunitstayid", "t_end", "label"])
+    # Coerce optional cols if present
+    if "t_event" in df.columns:
+        df["t_event"] = pd.to_numeric(df["t_event"], errors="coerce")
+    if "lead_time_mins" in df.columns:
+        df["lead_time_mins"] = pd.to_numeric(df["lead_time_mins"], errors="coerce")
+
+    df = df.dropna(subset=["patientunitstayid", "t_end", "label", "split"])
 
     df["patientunitstayid"] = df["patientunitstayid"].astype(np.int64)
     df["t_end"] = df["t_end"].astype(np.int64)
     df["label"] = df["label"].astype(np.int64)
 
-    return df
+    df["split"] = df["split"].astype(str).str.lower()
+    bad = ~df["split"].isin(["train", "val", "test"])
+    if bad.any():
+        bad_vals = sorted(df.loc[bad, "split"].unique().tolist())
+        raise ValueError(f"samples.csv has invalid split values: {bad_vals}")
 
+    return df
 
 
 def _read_features(features_path: str) -> pd.DataFrame:
     df = pd.read_parquet(features_path)
+
     need = {"patientunitstayid", "t_end"}
     missing = need - set(df.columns)
     if missing:
@@ -55,15 +75,11 @@ def _read_features(features_path: str) -> pd.DataFrame:
 
     df = df.copy()
 
-    # Robust numeric coercion (handles NaN/inf/object types)
+    df = df.replace([np.inf, -np.inf], np.nan)
     df["patientunitstayid"] = pd.to_numeric(df["patientunitstayid"], errors="coerce")
     df["t_end"] = pd.to_numeric(df["t_end"], errors="coerce")
-
-    # Drop invalid rows before casting to int
-    df = df.replace([np.inf, -np.inf], np.nan)
     df = df.dropna(subset=["patientunitstayid", "t_end"])
 
-    # Cast after cleanup
     df["patientunitstayid"] = df["patientunitstayid"].astype(np.int64)
     df["t_end"] = df["t_end"].astype(np.int64)
 
@@ -71,37 +87,14 @@ def _read_features(features_path: str) -> pd.DataFrame:
 
 
 def _select_feature_columns(df: pd.DataFrame) -> List[str]:
-    # Keep numeric columns only, drop id/time/label.
-    drop = {"patientunitstayid", "t_end", "label"}
+    # Exclude identifiers, labels, split, and evaluation-only time columns.
+    drop = {"patientunitstayid", "t_end", "label", "split", "t_event", "lead_time_mins"}
+
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     cols = [c for c in numeric_cols if c not in drop]
     if not cols:
         raise ValueError("No numeric feature columns found after filtering.")
     return cols
-
-
-def make_patient_splits(
-    pids: np.ndarray,
-    seed: int = 42,
-    val_frac: float = 0.15,
-    test_frac: float = 0.15,
-) -> SplitIndices:
-    if val_frac <= 0 or test_frac <= 0 or (val_frac + test_frac) >= 0.9:
-        raise ValueError("Bad split fractions. Use something like val=0.15, test=0.15.")
-
-    pids = np.unique(pids.astype(np.int64))
-    rng = np.random.default_rng(seed)
-    rng.shuffle(pids)
-
-    n = len(pids)
-    n_test = int(round(n * test_frac))
-    n_val = int(round(n * val_frac))
-
-    test_pids = pids[:n_test]
-    val_pids = pids[n_test : n_test + n_val]
-    train_pids = pids[n_test + n_val :]
-
-    return SplitIndices(train_pids=train_pids, val_pids=val_pids, test_pids=test_pids)
 
 
 def _compute_norm_stats(df: pd.DataFrame, feature_cols: List[str]) -> Tuple[np.ndarray, np.ndarray]:
@@ -139,7 +132,6 @@ def _restrict_to_topk_features(
         ranked = [f for f in r["feature"].astype(str).tolist() if f in feature_cols]
 
     if ranked is None or len(ranked) == 0:
-        # Fallback: rank by variance on the current df
         tmp = df[feature_cols].to_numpy(dtype=np.float32)
         tmp = np.nan_to_num(tmp, nan=0.0, posinf=0.0, neginf=0.0)
         var = tmp.var(axis=0)
@@ -147,6 +139,17 @@ def _restrict_to_topk_features(
         ranked = [feature_cols[i] for i in order.tolist()]
 
     return ranked[:top_k]
+
+
+def _assert_patient_split_consistent(samples: pd.DataFrame) -> None:
+    grp = samples.groupby("patientunitstayid")["split"].nunique()
+    bad = grp[grp > 1]
+    if len(bad) > 0:
+        example_pids = bad.index[:10].tolist()
+        raise ValueError(
+            "Patient leakage detected: some patientunitstayid appear in multiple splits. "
+            f"Examples: {example_pids}. Fix samples.csv split assignment to be patient-level."
+        )
 
 
 class PatientSequenceDataset(Dataset):
@@ -160,11 +163,9 @@ class PatientSequenceDataset(Dataset):
     def __init__(
         self,
         split: str,
-        disease: Optional[str] = None,
+        disease: Optional[config.DiseaseSpec] = None,
         max_len: int = 128,
-        seed: int = 42,
-        val_frac: float = 0.15,
-        test_frac: float = 0.15,
+        seed: int = 42,  # kept for compatibility
         normalize: bool = True,
         cached_norm_path: Optional[str] = None,
         top_k: Optional[int] = None,
@@ -188,6 +189,8 @@ class PatientSequenceDataset(Dataset):
         samples = _read_samples(samples_path)
         feats = _read_features(features_path)
 
+        _assert_patient_split_consistent(samples)
+
         df = samples.merge(feats, on=["patientunitstayid", "t_end"], how="inner")
         if df.empty:
             raise ValueError("Merged dataset is empty. Check that samples.csv and features.parquet align.")
@@ -196,25 +199,11 @@ class PatientSequenceDataset(Dataset):
 
         feature_cols = _select_feature_columns(df)
 
-        # Patient splits
-        splits = make_patient_splits(
-            pids=df["patientunitstayid"].to_numpy(),
-            seed=seed,
-            val_frac=val_frac,
-            test_frac=test_frac,
-        )
-
-        if split == "train":
-            keep = set(splits.train_pids.tolist())
-        elif split == "val":
-            keep = set(splits.val_pids.tolist())
-        else:
-            keep = set(splits.test_pids.tolist())
-
-        df = df[df["patientunitstayid"].isin(keep)].copy()
+        # filter by provided split
+        df = df[df["split"] == split].copy()
         df = df.sort_values(["patientunitstayid", "t_end"]).reset_index(drop=True)
         if df.empty:
-            raise ValueError(f"No rows left after applying split='{split}'. Check split fractions/seed.")
+            raise ValueError(f"No rows left after applying split='{split}'. Check samples.csv split column.")
 
         # Optional: restrict to top-K features
         if top_k is not None:
@@ -231,23 +220,20 @@ class PatientSequenceDataset(Dataset):
                 self.mean = norm["mean"].astype(np.float32)
                 self.std = norm["std"].astype(np.float32)
             else:
-                # Compute on TRAIN split from the full merged dataset (then apply to this split)
                 df_train = samples.merge(feats, on=["patientunitstayid", "t_end"], how="inner")
                 df_train = df_train.sort_values(["patientunitstayid", "t_end"]).reset_index(drop=True)
-                df_train = df_train[df_train["patientunitstayid"].isin(set(splits.train_pids.tolist()))].copy()
+                df_train = df_train[df_train["split"] == "train"].copy()
                 df_train = df_train.sort_values(["patientunitstayid", "t_end"]).reset_index(drop=True)
 
-                # If we restricted to top_k, compute stats only for those same columns
                 mean, std = _compute_norm_stats(df_train, self.feature_cols)
                 self.mean, self.std = mean, std
 
             _apply_norm(df, self.feature_cols, self.mean, self.std)
 
-        # Store
         self.df = df
         self.pids = df["patientunitstayid"].unique().astype(np.int64)
 
-        # Pre-store group indices for speed
+        # pre-store group indices
         self._groups: List[np.ndarray] = []
         pid_values = df["patientunitstayid"].to_numpy(dtype=np.int64)
 
@@ -272,7 +258,7 @@ class PatientSequenceDataset(Dataset):
         x = sub[self.feature_cols].to_numpy(dtype=np.float32)  # (T, D)
         y = sub["label"].to_numpy(dtype=np.int64)  # (T,)
 
-        # Truncate to max_len from the end (most recent windows)
+        # truncate from end
         if len(y) > self.max_len:
             x = x[-self.max_len :]
             y = y[-self.max_len :]
@@ -280,8 +266,8 @@ class PatientSequenceDataset(Dataset):
         length = np.int64(len(y))
 
         return (
-            torch.from_numpy(x),  # (T, D)
-            torch.from_numpy(y),  # (T,)
+            torch.from_numpy(x),
+            torch.from_numpy(y),
             torch.tensor(length, dtype=torch.long),
         )
 
@@ -296,7 +282,7 @@ def pad_collate(batch):
       lengths: (B,)
     """
     xs, ys, lens = zip(*batch)
-    lengths = torch.stack(lens, dim=0)  # (B,)
+    lengths = torch.stack(lens, dim=0)
 
     bsz = len(xs)
     d = xs[0].shape[1]

@@ -1,6 +1,7 @@
 # prepare_data.py
 # Build rolling-window samples.csv for a chosen disease definition.
-# Adds patient-level train/test split to avoid patient overlap across sets.
+# Adds patient-level train/val/test split to avoid patient overlap across sets.
+# Also stores t_event (onset time) and lead_time_mins for true lead-time stratification.
 # Location: Project/Code/prepare_data.py
 
 from __future__ import annotations
@@ -53,8 +54,6 @@ def split_diagnosisstring(diagnoses: pd.DataFrame) -> pd.DataFrame:
 
 
 def filter_disease_rows(diagnoses: pd.DataFrame, disease: config.DiseaseSpec) -> pd.DataFrame:
-    # If disease.subcategory is None: match major only.
-    # Else: match major + subcategory.
     df = split_diagnosisstring(diagnoses)
 
     major = disease.major.strip().lower()
@@ -79,7 +78,6 @@ def compute_onset_times(disease_rows: pd.DataFrame) -> pd.Series:
 
 
 def compute_max_offsets_across_tables(data_dir: Path, chunksize: int = 1_000_000) -> pd.Series:
-    # Compute max observed offset per patient across the main time-series/event tables we use.
     sources = [
         ("vitalPeriodic.csv.gz", "observationoffset", ["patientunitstayid", "observationoffset"]),
         ("vitalAperiodic.csv.gz", "observationoffset", ["patientunitstayid", "observationoffset"]),
@@ -147,7 +145,14 @@ def generate_patient_windows(
     stride_mins: int,
     require_full_horizon: bool,
     stop_after_event: bool,
-) -> List[Tuple[int, int, int]]:
+) -> List[Tuple[int, int, int, float, float]]:
+    """
+    Returns rows:
+      (patientunitstayid, t_end, label, t_event, lead_time_mins)
+
+    t_event is onset_time for this patient (float, NaN if None)
+    lead_time_mins = onset_time - t_end for event patients, else NaN
+    """
     last_t_end = max_offset
     if require_full_horizon:
         last_t_end = max_offset - horizon_mins
@@ -157,25 +162,34 @@ def generate_patient_windows(
 
     t_ends = list(range(history_mins, last_t_end + 1, stride_mins))
 
-    rows: List[Tuple[int, int, int]] = []
+    t_event = float(onset_time) if onset_time is not None else float("nan")
+
+    rows: List[Tuple[int, int, int, float, float]] = []
     for t_end in t_ends:
         if onset_time is not None and stop_after_event and t_end >= onset_time:
             break
 
         label = 0
         if onset_time is not None:
-            # label 1 if onset is within (t_end, t_end + horizon]
             if (t_end < onset_time) and (onset_time <= t_end + horizon_mins):
                 label = 1
 
-        rows.append((patient_id, t_end, label))
+        lead_time = float(onset_time - t_end) if onset_time is not None else float("nan")
+        rows.append((patient_id, t_end, label, t_event, lead_time))
 
     return rows
 
 
-def add_patient_level_split(samples_df: pd.DataFrame) -> pd.DataFrame:
-    # Patient-level split: all windows from a patient go to the same split.
-    # Stratify by whether the patient ever has a positive window.
+def add_patient_level_splits(samples_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Patient-level split: all windows from a patient go to the same split.
+
+    Produces train/val/test:
+      - First split test using config.TEST_SIZE
+      - Then split remaining into train/val using config.VAL_SIZE (or default 0.15)
+
+    Stratify by whether the patient ever has a positive window.
+    """
     per_patient = (
         samples_df.groupby("patientunitstayid")["label"]
         .max()
@@ -188,19 +202,43 @@ def add_patient_level_split(samples_df: pd.DataFrame) -> pd.DataFrame:
     strat = per_patient["patient_has_positive"].to_numpy()
 
     test_size = float(getattr(config, "TEST_SIZE", 0.2))
+    val_size = float(getattr(config, "VAL_SIZE", 0.15))
     rs = int(getattr(config, "SPLIT_RANDOM_STATE", 42))
 
-    train_pids, test_pids = train_test_split(
+    # Split off test
+    trainval_pids, test_pids = train_test_split(
         pids,
         test_size=test_size,
         random_state=rs,
         stratify=strat,
     )
 
+    # Split train/val from remaining
+    trainval_strat = per_patient.set_index("patientunitstayid").loc[trainval_pids, "patient_has_positive"].to_numpy()
+
+    # val_size is fraction of total; convert to fraction of trainval
+    trainval_frac = 1.0 - test_size
+    if trainval_frac <= 0.0:
+        raise ValueError("TEST_SIZE too large.")
+
+    val_frac_of_trainval = val_size / trainval_frac
+    val_frac_of_trainval = float(np.clip(val_frac_of_trainval, 0.01, 0.8))
+
+    train_pids, val_pids = train_test_split(
+        trainval_pids,
+        test_size=val_frac_of_trainval,
+        random_state=rs,
+        stratify=trainval_strat,
+    )
+
     train_set = set(int(x) for x in train_pids.tolist())
-    split_col = np.where(samples_df["patientunitstayid"].isin(train_set), "train", "test")
+    val_set = set(int(x) for x in val_pids.tolist())
+
     out = samples_df.copy()
-    out["split"] = split_col
+    out["split"] = "test"
+    out.loc[out["patientunitstayid"].isin(train_set), "split"] = "train"
+    out.loc[out["patientunitstayid"].isin(val_set), "split"] = "val"
+
     return out
 
 
@@ -251,7 +289,7 @@ def main() -> None:
     require_full_horizon = config.REQUIRE_FULL_HORIZON
     stop_after_event = True
 
-    all_rows: List[Tuple[int, int, int]] = []
+    all_rows: List[Tuple[int, int, int, float, float]] = []
 
     eligible_patients = [pid for pid in all_patients if pid in max_offsets.index]
     print(f"Patients present in coverage index: {len(eligible_patients)}")
@@ -273,7 +311,10 @@ def main() -> None:
         if rows:
             all_rows.extend(rows)
 
-    samples_df = pd.DataFrame(all_rows, columns=["patientunitstayid", "t_end", "label"])
+    samples_df = pd.DataFrame(
+        all_rows,
+        columns=["patientunitstayid", "t_end", "label", "t_event", "lead_time_mins"],
+    )
     if samples_df.empty:
         raise RuntimeError("No samples were generated. Check disease filter and coverage rules.")
 
@@ -310,20 +351,26 @@ def main() -> None:
 
     neg_df = neg_df.sample(n=target_neg, random_state=config.SEED).reset_index(drop=True)
 
-    balanced_df = pd.concat([pos_df, neg_df], axis=0).sample(frac=1.0, random_state=config.SEED).reset_index(drop=True)
+    balanced_df = (
+        pd.concat([pos_df, neg_df], axis=0)
+        .sample(frac=1.0, random_state=config.SEED)
+        .reset_index(drop=True)
+    )
 
     print(f"Balanced samples total: {len(balanced_df)}")
     print(f"Balanced positives: {int(balanced_df['label'].sum())}")
     print(f"Balanced negatives: {int((balanced_df['label'] == 0).sum())}")
 
     print("#############################")
-    print("Assigning patient-level train/test split")
+    print("Assigning patient-level train/val/test split")
     print("#############################")
-    balanced_df = add_patient_level_split(balanced_df)
+    balanced_df = add_patient_level_splits(balanced_df)
 
     train_n = int((balanced_df["split"] == "train").sum())
+    val_n = int((balanced_df["split"] == "val").sum())
     test_n = int((balanced_df["split"] == "test").sum())
     print(f"Train windows: {train_n}")
+    print(f"Val windows:   {val_n}")
     print(f"Test windows:  {test_n}")
 
     print("#############################")
@@ -345,21 +392,24 @@ def main() -> None:
             "stop_after_event": stop_after_event,
         },
         "split": {
-            "type": "patient_level",
+            "type": "patient_level_train_val_test",
             "test_size": float(getattr(config, "TEST_SIZE", 0.2)),
+            "val_size": float(getattr(config, "VAL_SIZE", 0.15)),
             "random_state": int(getattr(config, "SPLIT_RANDOM_STATE", 42)),
         },
         "seed": config.SEED,
         "counts": {
-            "generated_total": n_total,
-            "generated_pos": n_pos,
-            "generated_neg": n_neg,
+            "generated_total": int(n_total),
+            "generated_pos": int(n_pos),
+            "generated_neg": int(n_neg),
             "balanced_total": int(len(balanced_df)),
             "balanced_pos": int(balanced_df["label"].sum()),
             "balanced_neg": int((balanced_df["label"] == 0).sum()),
             "train_windows": train_n,
+            "val_windows": val_n,
             "test_windows": test_n,
             "train_patients": int(balanced_df.loc[balanced_df["split"] == "train", "patientunitstayid"].nunique()),
+            "val_patients": int(balanced_df.loc[balanced_df["split"] == "val", "patientunitstayid"].nunique()),
             "test_patients": int(balanced_df.loc[balanced_df["split"] == "test", "patientunitstayid"].nunique()),
         },
     }
