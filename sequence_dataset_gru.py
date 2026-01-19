@@ -88,7 +88,12 @@ def _read_features(features_path: str) -> pd.DataFrame:
 
 def _select_feature_columns(df: pd.DataFrame) -> List[str]:
     # Exclude identifiers, labels, split, and evaluation-only time columns.
-    drop = {"patientunitstayid", "t_end", "label", "split", "t_event", "lead_time_mins"}
+    drop = {
+    "patientunitstayid", "t_end", "label", "split",
+    "t_event", "lead_time_mins",
+    "t_event_missing", "lead_time_mins_missing",
+    }
+
 
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     cols = [c for c in numeric_cols if c not in drop]

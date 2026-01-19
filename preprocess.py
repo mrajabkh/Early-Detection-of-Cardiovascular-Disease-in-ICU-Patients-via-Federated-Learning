@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Set
 
 import numpy as np
 import pandas as pd
@@ -14,6 +14,26 @@ import pandas as pd
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+
+
+#############################
+# Leak-prone columns
+#############################
+def _leak_cols() -> Set[str]:
+    return {
+        "t_event",
+        "lead_time_mins",
+        "t_event_missing",
+        "lead_time_mins_missing",
+    }
+
+
+def _is_vital_feature(col: str) -> bool:
+    # Define vitals as bedside physiologic signals from:
+    # - vitalPeriodic (vp_)
+    # - vitalAperiodic (va_)
+    c = str(col)
+    return c.startswith("vp_") or c.startswith("va_")
 
 
 #############################
@@ -90,7 +110,6 @@ def build_xy(
     features_df: pd.DataFrame,
     samples_df: pd.DataFrame,
 ) -> Tuple[pd.DataFrame, pd.Series, Optional[pd.Series]]:
-    # Align features with samples by (patientunitstayid, t_end).
     key_cols = ["patientunitstayid", "t_end"]
 
     merged = samples_df.merge(
@@ -114,18 +133,34 @@ def build_xy(
     if "split" in merged.columns:
         split_col = merged["split"].astype(str)
 
+    # Drop identifiers, label, split, and leak columns if present
     drop_cols = set(key_cols + ["label"])
     if "split" in merged.columns:
         drop_cols.add("split")
 
+    for c in _leak_cols():
+        if c in merged.columns:
+            drop_cols.add(c)
+
     feature_cols = [c for c in merged.columns if c not in drop_cols]
+
+    # Numeric only
     X_numeric = merged[feature_cols].select_dtypes(include=[np.number]).copy()
 
-    cols_with_missing = X_numeric.isna().any(axis=0)
-    missing_mask = X_numeric.loc[:, cols_with_missing].isna().astype(int)
-    missing_mask.columns = [f"{c}_missing" for c in missing_mask.columns]
+    # Missingness indicators ONLY for vitals (vp_, va_)
+    vital_cols = [c for c in X_numeric.columns if _is_vital_feature(c)]
+    if vital_cols:
+        cols_with_missing = X_numeric[vital_cols].isna().any(axis=0)
+        vital_missing_cols = cols_with_missing[cols_with_missing].index.tolist()
 
-    X = pd.concat([X_numeric, missing_mask], axis=1)
+        if vital_missing_cols:
+            missing_mask = X_numeric[vital_missing_cols].isna().astype(int)
+            missing_mask.columns = [f"{c}_missing" for c in missing_mask.columns]
+            X = pd.concat([X_numeric, missing_mask], axis=1)
+        else:
+            X = X_numeric
+    else:
+        X = X_numeric
 
     X.index = pd.RangeIndex(start=0, stop=len(X), step=1)
     y.index = X.index
@@ -148,7 +183,6 @@ def split_and_preprocess(
     impute_strategy: str = "median",
     scale_numeric: bool = True,
 ) -> SplitData:
-    # If split_col exists, use it. Else fall back to random window-level split.
     if split_col is not None:
         train_mask = (split_col == "train").to_numpy()
         test_mask = (split_col == "test").to_numpy()

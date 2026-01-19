@@ -220,9 +220,8 @@ def evaluate_stratified_lead_time(
     """
     True lead-time stratification using lead_time_mins from samples.csv.
 
-    For a given bucket, keep:
-      - all negatives
-      - only positives whose lead_time is in the bucket
+    For a given bucket, evaluate ONLY windows whose lead_time_mins is in the bucket.
+    This avoids inflating metrics by mixing in "easy negatives" from other lead times.
 
     Also saves a PR curve plot for the buckets into:
       Outputs/<run_name>/PR_Plots/
@@ -258,18 +257,16 @@ def evaluate_stratified_lead_time(
             if len(y) == 0:
                 continue
 
+            # Keep only windows in this lead-time bucket
+            keep = np.isfinite(lt) & (lt >= lo) & (lt < hi)
+            if not np.any(keep):
+                continue
+
             xt = torch.from_numpy(x[None, :, :]).to(device)
             lengths = torch.tensor([len(y)], dtype=torch.long, device=device)
 
             logits = model(xt, lengths)
             probs = torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
-
-            neg_mask = (y == 0)
-            pos_mask = (y == 1) & np.isfinite(lt) & (lt >= lo) & (lt < hi)
-
-            keep = neg_mask | pos_mask
-            if not np.any(keep):
-                continue
 
             y_all.extend(y[keep].tolist())
             s_all.extend(probs[keep].tolist())

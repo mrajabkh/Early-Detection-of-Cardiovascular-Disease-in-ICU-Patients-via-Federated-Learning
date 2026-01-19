@@ -37,8 +37,8 @@ DISEASE = DiseaseSpec(
 #############################
 # Rolling window settings
 #############################
-HISTORY_HRS = 24
-HORIZON_HRS = 24
+HISTORY_HRS = 12
+HORIZON_HRS = 12
 STRIDE_MINS = 60
 
 HISTORY_MINS = HISTORY_HRS * 60
